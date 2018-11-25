@@ -1,0 +1,167 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel UniformGridSampler
+#pragma kernel UpdatePhysicalModel
+//#pragma kernel CreateGrassPoints
+//#pragma kernel UpdateGrassPhysics
+
+
+
+//////////////////
+// Constants
+#define PI (3.14159265359)
+#define TWOPI (6.28318530718)
+
+//////////////////
+// Global Uniforms
+float dt;
+
+
+float random(float2 p)
+{
+	return frac(cos(dot(p, float2(23.14069263277926, 2.665144142690225)))*123456.);
+}
+
+float random2(float2 co)
+{
+	return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float random3(float2 p)
+{
+	float2 r = float2(
+		23.14069263277926, // e^pi (Gelfond's constant)
+		2.665144142690225 // 2^sqrt(2) (Gelfondâ€“Schneider constant)
+	);
+	return frac(cos(fmod(12345678., 256. * dot(p, r))));
+}
+
+//////////////////////////////////////////////////////////////////////
+// Update Physical Model Kernel
+//
+Texture2D<float4> texDisplacementIn;
+Texture2D<float4> texVelocityIn;
+Texture2D<float4> texExternalForces;
+
+RWTexture2D<float4> texDisplacement;
+RWTexture2D<float4> texVelocity;
+
+float k;
+float damping;
+float2 windDirection;
+float windTime;
+int windEnabled;
+float windForce;
+float impulseForce;
+
+// Movement offset in meters.
+float2 movementOffset;
+float2 worldPos;
+// Number of texels per meter.
+float2 texelsPerMeter;
+SamplerState samplertexDisplacementIn;
+SamplerState samplertexVelocityIn;
+SamplerState samplertexExternalForces;
+
+[numthreads(32,32,1)]
+void UpdatePhysicalModel(uint3 id : SV_DispatchThreadID)
+{
+	// id in units of texels.
+	// Divide by 1024 to get 0 to 1 coordinates.
+	// so movementOffset is in texels, but it depends on the texel size.
+	// Using a 10x10 plane with 1024x1024 texels, each texel is 10/1024 meters.
+	// So if we move one meter, we need to shift by 102.4 texels.
+
+	// 0 to 1
+	float2 uv = (id.xy + 0.5) / float2(1024, 1024);
+	float2 uvOffset = (-movementOffset * texelsPerMeter) / float2(1024, 1024);
+
+
+	// Sample current displacement factoring in movement offset.
+	float3 d = texDisplacementIn.SampleLevel(samplertexDisplacementIn, uv + uvOffset, 0).xyz;
+	float3 v = texVelocityIn.SampleLevel(samplertexVelocityIn, uv + uvOffset, 0).xyz;
+	float3 externalForce = -impulseForce * texExternalForces.SampleLevel(samplertexExternalForces, uv + uvOffset, 0).xyz;
+
+	// Calculate force of wind as function of global texel position.
+	// uv.x = local offset on texture.
+	// worldPos.x = world position in texels.
+	if (windEnabled == 1)
+	{
+		float2 windTangent = float2(windDirection.y, -windDirection.x);
+
+		float posDotWindDirection = dot(uv - worldPos * texelsPerMeter, windDirection);
+		float posDotWindTangent = dot(uv - worldPos * texelsPerMeter, windTangent);
+
+		float2 pos = float2(posDotWindDirection, posDotWindTangent);
+
+		float waveFormX = 1.0 * (0.5 * sin(pos.x * 7 + 3 * windTime) + 0.5) +
+						 0.5 * (0.5 * sin(pos.x * 9 + 5 * windTime) + 0.5) +
+						 0.25 * (0.5 * sin(pos.x * 11 + 7 * windTime) + 0.5);
+		waveFormX *= waveFormX;
+
+		float waveFormY = 1.0 * (0.5 * sin(pos.y * 7  + 0.27 * windTime) + 0.5) +
+						  0.5 * (0.5 * sin(pos.y * 9  + 1.67 * windTime) + 0.5) +
+						  0.25 * (0.5 * sin(pos.y * 11 + 3.27 * windTime) + 0.5);
+		waveFormX *= (waveFormY / 1.75);
+
+		float2 windMagnitude = 24 * windForce * windDirection * waveFormX;
+		float2 wind = windMagnitude;
+		externalForce += float3(wind.x, 0, wind.y);
+	}
+
+	float3 a = externalForce + -k * d - damping * v;
+	v += a * dt;
+	d += v * dt;
+
+	texDisplacement[id.xy] = float4(d, 1);
+	texVelocity[id.xy] = float4(v,1);
+}
+// 
+// Update Physical Model Kernel
+//////////////////////////////////////////////////////////////////////
+
+
+//////////////////////////////////////////////////////////////////////
+// Uniform Grid Random Sampling
+//
+int2 gridDimensions; // dimensions of uniform grid being sampled
+float2 gridWorldSize; // Size of grid in world coordinates.
+
+float2 centerPoint;	// World space center point of area
+float density;
+float offsetMultiplier;
+AppendStructuredBuffer<float2> grassPoints;
+
+[numthreads(32,32,1)]
+void UniformGridSampler(uint3 id : SV_DispatchThreadID)
+{
+	float2 gridSpacing = gridWorldSize / gridDimensions;
+	// Divide CenterPoint by GridSpacing to figure out which grid point it's on.
+	float2 p = centerPoint / gridSpacing;
+	int2 gridCoord = id.xy - gridDimensions / (uint)2;
+
+	// Truncate to integer portion.
+	p = gridSpacing * (trunc(p) + gridCoord);
+
+	// Generate random number to compute random offset.
+	float r = random2(id.xy);
+
+	if (r <= density)
+	{
+		float rAngle = TWOPI * (r / density);
+
+		// Calculate random offset
+		float2 offset = offsetMultiplier * float2(cos(rAngle), sin(rAngle));
+		grassPoints.Append(p + offset);
+	}
+	//p += offset;
+
+	// Generate new random number to determine if grass blade is present
+	//float r2 = random3(id.xy);
+	//if (r2 <= density)
+	//{
+	//	grassPoints.Append((p + offset));
+	//}
+}
+//
+// Uniform Grid Random Sampling
+//////////////////////////////////////////////////////////////////////
